@@ -1,6 +1,9 @@
 import sys
 import os
+import socket
 import logging
+import shutil
+import subprocess
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -9,8 +12,8 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QLabel, QGroupBox, QCheckBox, QProgressBar,
                                QTableWidget, QTableWidgetItem,
                                QHeaderView, QMessageBox, QFileDialog, QSplitter)
-from PySide6.QtCore import QThread, Signal, QTimer, Qt, QUrl
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply, QSslSocket
+from PySide6.QtCore import QThread, Signal, QTimer, Qt, QUrl, QEventLoop
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply, QSslSocket, QHostInfo
 from PySide6.QtGui import QFont, QTextCursor, QColor
 
 
@@ -88,9 +91,6 @@ class NetworkTestWorker(QThread):
         """测试DNS解析"""
         self.log(f"开始DNS解析测试: {hostname}")
 
-        from PySide6.QtNetwork import QHostInfo
-        import socket
-
         try:
             # 方法1: 使用Qt的DNS解析
             host_info = QHostInfo.fromName(hostname)
@@ -114,8 +114,6 @@ class NetworkTestWorker(QThread):
     def test_tcp_connection(self, hostname, port):
         """测试TCP连接"""
         self.log(f"开始TCP连接测试: {hostname}:{port}")
-
-        import socket
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(10)
@@ -144,7 +142,6 @@ class NetworkTestWorker(QThread):
             reply = self.network_manager.get(request)
 
             # 等待请求完成
-            from PySide6.QtCore import QEventLoop
             loop = QEventLoop()
             reply.finished.connect(loop.quit)
             timer = QTimer()
@@ -193,7 +190,6 @@ class NetworkTestWorker(QThread):
 
             reply.sslErrors.connect(handle_ssl_errors)
 
-            from PySide6.QtCore import QEventLoop
             loop = QEventLoop()
             reply.finished.connect(loop.quit)
             timer = QTimer()
@@ -228,19 +224,39 @@ class NetworkTestWorker(QThread):
         """测试网络可达性"""
         self.log(f"开始网络可达性测试: {hostname}")
 
-        import subprocess
         try:
-            # 使用ping命令测试基本可达性
-            result = subprocess.run(
-                ["ping", "-n", "4", hostname],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
+            # 使用ping命令测试基本可达性，隐藏命令行窗口
+            if os.name == 'nt':  # Windows系统
+                result = subprocess.run(
+                    ["ping", "-n", "4", hostname],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    creationflags=subprocess.CREATE_NO_WINDOW  # 隐藏命令行窗口
+                )
+            else:  # Linux/Mac系统
+                result = subprocess.run(
+                    ["ping", "-c", "4", hostname],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
 
             if result.returncode == 0:
-                self.log(f"网络可达性测试成功: 可以ping通 {hostname}")
-                self.test_result_signal.emit("网络可达性", True, "ping测试成功")
+                # 解析ping结果获取统计信息
+                output_lines = result.stdout.split('\n')
+                stats_line = None
+                for line in output_lines:
+                    if "平均" in line or "Average" in line or "avg" in line:
+                        stats_line = line
+                        break
+
+                if stats_line:
+                    self.log(f"网络可达性测试成功: 可以ping通 {hostname} - {stats_line.strip()}")
+                    self.test_result_signal.emit("网络可达性", True, f"ping测试成功 - {stats_line.strip()}")
+                else:
+                    self.log(f"网络可达性测试成功: 可以ping通 {hostname}")
+                    self.test_result_signal.emit("网络可达性", True, "ping测试成功")
             else:
                 self.log(f"网络可达性测试失败: 无法ping通 {hostname}", "WARNING")
                 self.test_result_signal.emit("网络可达性", False, "ping测试失败")
@@ -286,7 +302,7 @@ class NetworkDiagnosticTool(QMainWindow):
 
     def init_ui(self):
         """初始化用户界面"""
-        self.setWindowTitle("网络诊断工具 - PySide6")
+        self.setWindowTitle("网络诊断工具 - v1.0.0 - PySide6")
         self.setGeometry(100, 100, 1200, 800)
 
         # 中心部件
@@ -515,7 +531,6 @@ class NetworkDiagnosticTool(QMainWindow):
         if file_path:
             try:
                 # 复制日志文件到指定位置
-                import shutil
                 shutil.copy2(self.log_file, file_path)
                 self.log(f"日志已导出到: {file_path}", "INFO")
                 QMessageBox.information(self, "导出成功", f"日志已成功导出到:\n{file_path}")
