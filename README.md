@@ -11,3 +11,9 @@
 后续会增加PyQt5的支持
 
 后续可能支持PySide2、PyQt4、PyQt6
+
+## 截图
+
+<p align="center">
+    <img width="600" src="images/screenshot.png">
+</p>
