@@ -1,6 +1,6 @@
 import subprocess
 
-current_version = "v1.0.0"
+current_version = "v1.1.0"
 # 定义版本号
 version = current_version.replace("v", "V")
 no_v_version = current_version.replace("v", "").replace("V", "")
