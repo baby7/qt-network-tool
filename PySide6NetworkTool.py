@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QTableWidget, QTableWidgetItem,
                                QHeaderView, QMessageBox, QFileDialog, QSplitter)
 from PySide6.QtCore import QThread, Signal, QTimer, Qt, QUrl, QEventLoop
-from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkReply, QSslSocket, QHostInfo
+from PySide6.QtNetwork import (QNetworkAccessManager, QNetworkRequest,
+                               QNetworkReply, QSslSocket, QHostInfo,
+                               QSslConfiguration, QSsl)
 from PySide6.QtGui import QFont, QTextCursor, QColor
 
 
@@ -94,7 +96,7 @@ class NetworkTestWorker(QThread):
         try:
             # 方法1: 使用Qt的DNS解析
             host_info = QHostInfo.fromName(hostname)
-            if host_info.error() == QHostInfo.NoError:
+            if host_info.error() == QHostInfo.HostInfoError.NoError:
                 addresses = host_info.addresses()
                 if addresses:
                     ip_list = [addr.toString() for addr in addresses]
@@ -115,60 +117,157 @@ class NetworkTestWorker(QThread):
         """测试TCP连接"""
         self.log(f"开始TCP连接测试: {hostname}:{port}")
         try:
+            # 设置更详细的socket选项
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)
+            sock.settimeout(15)  # 增加超时时间到15秒
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
             result = sock.connect_ex((hostname, port))
-            sock.close()
 
             if result == 0:
                 self.log(f"TCP连接成功: {hostname}:{port}")
                 self.test_result_signal.emit("TCP连接", True, f"成功连接到 {hostname}:{port}")
-            else:
-                self.log(f"TCP连接失败: 错误代码 {result}", "ERROR")
-                self.test_result_signal.emit("TCP连接", False, f"连接失败，错误代码: {result}")
 
+                # 获取连接详细信息
+                local_ip, local_port = sock.getsockname()
+                self.log(f"连接详情 - 本地: {local_ip}:{local_port} -> 远程: {hostname}:{port}")
+            else:
+                # 更详细的错误信息
+                error_messages = {
+                    10035: "非阻塞socket操作无法立即完成",
+                    10060: "连接超时",
+                    10061: "连接被拒绝",
+                    10054: "连接被对等方重置",
+                    11001: "主机名解析失败"
+                }
+                error_msg = error_messages.get(result, f"系统错误代码: {result}")
+                self.log(f"TCP连接失败: {error_msg} (错误代码: {result})", "ERROR")
+                self.test_result_signal.emit("TCP连接", False, f"{error_msg} (代码: {result})")
+
+            sock.close()
+
+        except socket.timeout:
+            self.log("TCP连接超时 (15秒)", "ERROR")
+            self.test_result_signal.emit("TCP连接", False, "连接超时 (15秒)")
         except Exception as e:
             self.log(f"TCP连接异常: {str(e)}", "ERROR")
             self.test_result_signal.emit("TCP连接", False, f"异常: {str(e)}")
 
     def test_http_request(self, url):
-        """测试HTTP请求"""
+        """测试HTTP请求 - 优化版本"""
         self.log(f"开始HTTP请求测试: {url}")
 
         try:
+            # 创建优化的网络请求
             request = QNetworkRequest(QUrl(url))
-            request.setRawHeader(b"User-Agent", b"NetworkDiagnosticTool/1.0")
+
+            # 设置网络请求属性 - 修复Qt6中的重定向设置
+            # Qt6中移除了FollowRedirectsAttribute，使用重定向策略
+            request.setAttribute(QNetworkRequest.Attribute.RedirectPolicyAttribute,
+                                 QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy)
+            request.setAttribute(QNetworkRequest.Attribute.HttpPipeliningAllowedAttribute, True)
+
+            # 如果是HTTPS，配置SSL
+            if QUrl(url).scheme() == "https":
+                ssl_config = QSslConfiguration.defaultConfiguration()
+                ssl_config.setPeerVerifyMode(QSslSocket.PeerVerifyMode.VerifyPeer)
+                ssl_config.setProtocol(QSsl.SslProtocol.AnyProtocol)
+                request.setSslConfiguration(ssl_config)
 
             reply = self.network_manager.get(request)
+
+            # 连接信号以获得更详细的错误信息
+            reply.errorOccurred.connect(lambda error: self._handle_http_error(reply, error))
+            if hasattr(reply, 'sslErrors'):
+                reply.sslErrors.connect(lambda errors: self._handle_ssl_errors(errors))
 
             # 等待请求完成
             loop = QEventLoop()
             reply.finished.connect(loop.quit)
+
+            # 设置更长的超时时间
             timer = QTimer()
-            timer.timeout.connect(loop.quit)
-            timer.start(15000)  # 15秒超时
+            timer.timeout.connect(lambda: self._handle_http_timeout(reply, loop))
+            timer.start(30000)  # 30秒超时
+
             loop.exec()
 
+            # 处理响应
             if reply.error() == QNetworkReply.NetworkError.NoError:
-                status_code = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
-                content_type = reply.header(QNetworkRequest.ContentTypeHeader)
+                status_code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+                content_type = reply.header(QNetworkRequest.KnownHeaders.ContentTypeHeader)
+                content_length = reply.header(QNetworkRequest.KnownHeaders.ContentLengthHeader)
+
+                # 读取响应内容（前500字符）
+                response_data = reply.read(500)
+                response_preview = response_data.data().decode('utf-8', errors='ignore') if response_data else ""
 
                 info = f"状态码: {status_code}"
                 if content_type:
                     info += f", 内容类型: {content_type}"
+                if content_length:
+                    info += f", 内容长度: {content_length} bytes"
+                if response_preview:
+                    info += f", 响应预览: {response_preview[:100]}{'...' if len(response_preview) > 100 else ''}"
 
                 self.log(f"HTTP请求成功 - {info}")
                 self.test_result_signal.emit("HTTP请求", True, info)
             else:
-                error_msg = f"错误: {reply.errorString()} (代码: {reply.error()})"
-                self.log(f"HTTP请求失败 - {error_msg}", "ERROR")
-                self.test_result_signal.emit("HTTP请求", False, error_msg)
+                # 错误信息已经在errorOccurred信号中处理
+                pass
 
             reply.deleteLater()
 
         except Exception as e:
             self.log(f"HTTP请求异常: {str(e)}", "ERROR")
             self.test_result_signal.emit("HTTP请求", False, f"异常: {str(e)}")
+
+    def _handle_http_error(self, reply, error):
+        """处理HTTP错误"""
+        error_messages = {
+            QNetworkReply.NetworkError.ConnectionRefusedError: "连接被服务器拒绝",
+            QNetworkReply.NetworkError.RemoteHostClosedError: "远程主机关闭连接",
+            QNetworkReply.NetworkError.HostNotFoundError: "主机未找到",
+            QNetworkReply.NetworkError.TimeoutError: "请求超时",
+            QNetworkReply.NetworkError.OperationCanceledError: "操作被取消",
+            QNetworkReply.NetworkError.SslHandshakeFailedError: "SSL握手失败",
+            QNetworkReply.NetworkError.TemporaryNetworkFailureError: "临时网络故障",
+            QNetworkReply.NetworkError.ProxyConnectionRefusedError: "代理连接被拒绝",
+            QNetworkReply.NetworkError.ProxyConnectionClosedError: "代理连接关闭",
+            QNetworkReply.NetworkError.ProxyNotFoundError: "代理未找到",
+            QNetworkReply.NetworkError.ProxyTimeoutError: "代理超时",
+            QNetworkReply.NetworkError.ProxyAuthenticationRequiredError: "需要代理认证",
+            QNetworkReply.NetworkError.ContentAccessDenied: "内容访问被拒绝",
+            QNetworkReply.NetworkError.ContentOperationNotPermittedError: "内容操作不允许",
+            QNetworkReply.NetworkError.ContentNotFoundError: "内容未找到",
+            QNetworkReply.NetworkError.AuthenticationRequiredError: "需要认证",
+            QNetworkReply.NetworkError.ContentReSendError: "内容重新发送错误",
+            QNetworkReply.NetworkError.ProtocolUnknownError: "协议未知错误",
+            QNetworkReply.NetworkError.ProtocolInvalidOperationError: "协议无效操作",
+            QNetworkReply.NetworkError.UnknownNetworkError: "未知网络错误",
+            QNetworkReply.NetworkError.UnknownProxyError: "未知代理错误",
+            QNetworkReply.NetworkError.UnknownContentError: "未知内容错误",
+            QNetworkReply.NetworkError.ProtocolFailure: "协议失败"
+        }
+
+        error_msg = error_messages.get(error, f"未知错误: {error}")
+        detailed_info = f"错误: {error_msg} (代码: {error}), 错误字符串: {reply.errorString()}"
+
+        self.log(f"HTTP请求失败 - {detailed_info}", "ERROR")
+        self.test_result_signal.emit("HTTP请求", False, detailed_info)
+
+    def _handle_ssl_errors(self, ssl_errors):
+        """处理SSL错误"""
+        error_strings = [error.errorString() for error in ssl_errors]
+        error_msg = "; ".join(error_strings)
+        self.log(f"SSL错误: {error_msg}", "WARNING")
+
+    def _handle_http_timeout(self, reply, loop):
+        """处理HTTP超时"""
+        self.log("HTTP请求超时 (30秒)", "ERROR")
+        self.test_result_signal.emit("HTTP请求", False, "请求超时 (30秒未响应)")
+        reply.abort()
+        loop.quit()
 
     def test_ssl_certificate(self, url):
         """测试SSL证书"""
@@ -178,8 +277,9 @@ class NetworkTestWorker(QThread):
             request = QNetworkRequest(QUrl(url))
 
             # SSL配置
-            ssl_config = request.sslConfiguration()
-            ssl_config.setPeerVerifyMode(QSslSocket.PeerVerifyMode.VerifyPeer)  # 验证对等证书
+            ssl_config = QSslConfiguration.defaultConfiguration()
+            ssl_config.setPeerVerifyMode(QSslSocket.PeerVerifyMode.VerifyPeer)
+            request.setSslConfiguration(ssl_config)
 
             reply = self.network_manager.get(request)
 
@@ -197,7 +297,7 @@ class NetworkTestWorker(QThread):
             timer.start(15000)
             loop.exec()
 
-            if reply.error() in [QNetworkReply.NetworkError.NoError, QNetworkReply.SslHandshakeFailedError]:
+            if reply.error() in [QNetworkReply.NetworkError.NoError, QNetworkReply.NetworkError.SslHandshakeFailedError]:
                 ssl_config = reply.sslConfiguration()
                 cert = ssl_config.peerCertificate()
 
@@ -206,8 +306,11 @@ class NetworkTestWorker(QThread):
                     self.test_result_signal.emit("SSL证书", False, "未获取到服务器证书")
                 else:
                     issuer = cert.issuerInfo(cert.SubjectInfo.CommonName)
+                    subject = cert.subjectInfo(cert.SubjectInfo.CommonName)
                     expiry_date = cert.expiryDate().toString("yyyy-MM-dd")
-                    info = f"颁发者: {issuer}, 过期时间: {expiry_date}"
+                    effective_date = cert.effectiveDate().toString("yyyy-MM-dd")
+
+                    info = f"颁发者: {issuer}, 主题: {subject}, 有效期: {effective_date} 至 {expiry_date}"
                     self.log(f"SSL证书信息: {info}")
                     self.test_result_signal.emit("SSL证书", True, info)
             else:
@@ -302,7 +405,7 @@ class NetworkDiagnosticTool(QMainWindow):
 
     def init_ui(self):
         """初始化用户界面"""
-        self.setWindowTitle("网络诊断工具 - v1.0.0 - PySide6")
+        self.setWindowTitle("网络诊断工具 - v1.1.0 - PySide6 (优化版)")
         self.setGeometry(100, 100, 1200, 800)
 
         # 中心部件
@@ -377,7 +480,7 @@ class NetworkDiagnosticTool(QMainWindow):
         main_layout.addWidget(self.progress_bar)
 
         # 分割区域
-        splitter = QSplitter(Qt.Vertical)
+        splitter = QSplitter(Qt.Orientation.Vertical)
 
         # 结果表格
         results_group = QGroupBox("检测结果")
@@ -386,7 +489,7 @@ class NetworkDiagnosticTool(QMainWindow):
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(3)
         self.results_table.setHorizontalHeaderLabels(["检测项目", "状态", "详细信息"])
-        self.results_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.results_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         results_layout.addWidget(self.results_table)
 
         splitter.addWidget(results_group)
@@ -406,7 +509,7 @@ class NetworkDiagnosticTool(QMainWindow):
         main_layout.addWidget(splitter)
 
         # 状态栏
-        self.statusBar().showMessage("就绪")
+        self.statusBar().showMessage("就绪 - 优化版本已启用更详细的错误报告")
 
     def start_test(self):
         """开始网络检测"""
@@ -464,6 +567,7 @@ class NetworkDiagnosticTool(QMainWindow):
         self.log("开始网络诊断测试...", "INFO")
         self.log(f"目标URL: {url}", "INFO")
         self.log(f"检测项目: {', '.join(tests_to_run)}", "INFO")
+        self.log("注意: 此版本已优化网络请求配置，提供更详细的错误信息", "INFO")
         self.statusBar().showMessage("测试进行中...")
 
     def stop_test(self):
@@ -483,7 +587,7 @@ class NetworkDiagnosticTool(QMainWindow):
 
         # 在界面显示
         self.log_display.append(log_entry)
-        self.log_display.moveCursor(QTextCursor.End)
+        self.log_display.moveCursor(QTextCursor.MoveOperation.End)
 
         # 记录到文件
         if level == "ERROR":
@@ -549,7 +653,7 @@ def main():
 
     # 设置应用属性
     app.setApplicationName("网络诊断工具")
-    app.setApplicationVersion("1.0")
+    app.setApplicationVersion("1.1")
     app.setOrganizationName("NetworkDiagnostic")
 
     window = NetworkDiagnosticTool()
